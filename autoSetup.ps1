@@ -314,23 +314,52 @@ function Show-UninstallGUI {
 }
 
 # ============================================================================
-# WINDOWS WIDGETS REMOVAL
+# WINDOWS WIDGETS MANAGEMENT
 # ============================================================================
 
-function Disable-WindowsWidgets {
-    Write-Host "`n[ACTION] Disabling Windows Widgets..." -ForegroundColor Cyan
-    $registryPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    $name = "TaskbarDa"
+function Enable-WindowsWidgets {
+    $registryPath = "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"
+    $name = "AllowNewsAndInterests"
+
     try {
-        if (-not (Test-Path $registryPath)) { New-Item -Path $registryPath -Force | Out-Null }
-        Set-ItemProperty -Path $registryPath -Name $name -Value 0 -Type DWord -ErrorAction Stop
-        Write-Host " [+] Widgets toggle turned off (TaskbarDa = 0)." -ForegroundColor Green
-        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Host " [!] Error: $($_.Exception.Message)" -ForegroundColor Red
+        if (-not (Test-Path $registryPath)) {
+            New-Item -Path $registryPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $registryPath -Name $name -Value 1 -Type DWord
+        Write-Host "[+] Policy updated: Windows Widgets (News and Interests) enabled." -ForegroundColor Green
+        Stop-Process -Name Explorer -Force
+        Write-Host "[+] Explorer restarted to apply system policy." -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "[!] Error: $($_.Exception.Message). Did you run as Administrator?" -ForegroundColor Red
     }
 }
 
+function Disable-WindowsWidgets {
+    $registryPath = "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"
+    $name = "AllowNewsAndInterests"
+
+    try {
+        # 1. Ensure the "Dsh" (Dashboard) key exists in Policies
+        if (-not (Test-Path $registryPath)) { 
+            New-Item -Path $registryPath -Force | Out-Null 
+        }
+
+        # 2. Set the value to 0 (Disabled)
+        # This is the "hard" disable that mimics the Group Policy Editor
+        Set-ItemProperty -Path $registryPath -Name $name -Value 0 -Type DWord
+        Write-Host "[+] Policy updated: Windows Widgets (News and Interests) disabled." -ForegroundColor Green
+
+        # 3. Force the shell to recognize the policy change
+        # Since HKLM policies usually require a restart or explorer kill, 
+        # we can try to nudge it, but killing Explorer is the most reliable here.
+        Stop-Process -Name Explorer -Force
+        Write-Host "[+] Explorer restarted to apply system policy." -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "[!] Error: $($_.Exception.Message). Did you run as Administrator?" -ForegroundColor Red
+    }
+}
 # ============================================================================
 # SUPERFETCH (SYSMAIN) MANAGEMENT
 # ============================================================================
@@ -525,126 +554,6 @@ function Invoke-AppRemoval {
     } catch {
         Write-Host " [!] Critical Error: Could not launch $name uninstaller." -ForegroundColor Red
     }
-}
-
-# ============================================================================
-# PROVISIONED PACKAGE REMOVAL
-# ============================================================================
-
-function Remove-ProvisionedBloatware {
-    Write-Host "`n[ACTION] Scanning provisioned packages..." -ForegroundColor Cyan
-
-    $allProvisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Sort-Object DisplayName
-
-    if (-not $allProvisioned) {
-        Write-Host " [!] No provisioned packages found." -ForegroundColor Yellow
-        return
-    }
-
-    [xml]$xaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Provisioned Package Removal" Height="700" Width="500"
-        Background="#121212" WindowStartupLocation="CenterScreen">
-    <Grid Margin="15">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <TextBlock Text="Remove Provisioned Packages" Foreground="#ff00ff" FontSize="18" FontWeight="Bold" Margin="0,0,0,6"/>
-        <TextBlock Grid.Row="1" TextWrapping="Wrap" Foreground="#aaaaaa" FontSize="12" Margin="0,0,0,10"
-                   Text="These packages are installed for every NEW user account created on this machine. Removing them here prevents future accounts from receiving them."/>
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
-            <Button x:Name="BtnSelectAll"  Content="Select All" Width="100" Height="26" Background="#333333" Foreground="White" Margin="0,0,8,0"/>
-            <Button x:Name="BtnSelectNone" Content="Clear All"  Width="100" Height="26" Background="#333333" Foreground="White" Margin="0,0,8,0"/>
-        </StackPanel>
-        <ListBox x:Name="PkgListBox" Grid.Row="3" Background="#1e1e1e" Foreground="White" BorderThickness="0">
-            <ListBox.ItemTemplate>
-                <DataTemplate>
-                    <StackPanel Orientation="Horizontal" Margin="2">
-                        <CheckBox IsChecked="{Binding IsChecked}" Margin="0,0,10,0" VerticalAlignment="Center"/>
-                        <StackPanel>
-                            <TextBlock Text="{Binding DisplayName}" FontSize="13" VerticalAlignment="Center"/>
-                            <TextBlock Text="{Binding Version}"     FontSize="10" Foreground="#888888"/>
-                        </StackPanel>
-                    </StackPanel>
-                </DataTemplate>
-            </ListBox.ItemTemplate>
-        </ListBox>
-        <Button x:Name="BtnDeprovision" Grid.Row="4" Content="DEPROVISION SELECTED"
-                Height="35" Margin="0,15,0,0" Background="#ff3333" Foreground="White" FontWeight="Bold"/>
-    </Grid>
-</Window>
-"@
-
-    $reader = New-Object System.Xml.XmlNodeReader $xaml
-    $window = [Windows.Markup.XamlReader]::Load($reader)
-
-    $wrappedList = foreach ($pkg in $allProvisioned) {
-        [PSCustomObject]@{
-            DisplayName = $pkg.DisplayName
-            Version     = $pkg.Version
-            IsChecked   = $false
-            Original    = $pkg
-        }
-    }
-
-    $listBox = $window.FindName("PkgListBox")
-    $listBox.ItemsSource = $wrappedList
-
-    ($window.FindName("BtnSelectAll")).Add_Click({
-        foreach ($item in $wrappedList) { $item.IsChecked = $true }
-        $listBox.Items.Refresh()
-    })
-
-    ($window.FindName("BtnSelectNone")).Add_Click({
-        foreach ($item in $wrappedList) { $item.IsChecked = $false }
-        $listBox.Items.Refresh()
-    })
-
-    ($window.FindName("BtnDeprovision")).Add_Click({
-        $selected = $wrappedList | Where-Object { $_.IsChecked }
-        if (-not $selected) {
-            [System.Windows.MessageBox]::Show(
-                "No packages selected.",
-                "Nothing to do",
-                [System.Windows.MessageBoxButton]::OK,
-                [System.Windows.MessageBoxImage]::Information
-            ) | Out-Null
-            return
-        }
-        $result = [System.Windows.MessageBox]::Show(
-            "This will deprovision $($selected.Count) package(s).`n`nNew user accounts will NOT receive these apps.`n`nContinue?",
-            "Confirm Deprovision",
-            [System.Windows.MessageBoxButton]::OKCancel,
-            [System.Windows.MessageBoxImage]::Warning
-        )
-        if ($result -eq [System.Windows.MessageBoxResult]::OK) {
-            $window.DialogResult = $true
-            $window.Close()
-        }
-    })
-
-    if (-not $window.ShowDialog()) { return }
-
-    $toRemove = $wrappedList | Where-Object { $_.IsChecked }
-    Write-Host "`n[ACTION] Deprovisioning $($toRemove.Count) package(s)..." -ForegroundColor Cyan
-
-    foreach ($item in $toRemove) {
-        $pkg = $item.Original
-        Write-Host " [>] Deprovisioning: $($pkg.DisplayName)" -ForegroundColor Cyan
-        try {
-            Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
-            Write-Host " [+] Done: $($pkg.DisplayName)" -ForegroundColor Green
-        } catch {
-            Write-Host " [!] Failed: $($pkg.DisplayName) - $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-
-    Write-Host " [+] Deprovisioning complete." -ForegroundColor Green
 }
 
 # ============================================================================
@@ -934,50 +843,204 @@ function Set-ActiveHours {
 }
 
 function Show-WindowsSettingsMenu {
-    Clear-Host
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "    WINDOWS SETTINGS"                      -ForegroundColor White
-    Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "`n1. Disable Windows Widgets"              -ForegroundColor White
-    Write-Host "2. Enable Microsoft Product Updates"       -ForegroundColor White
-    Write-Host "3. Set Active Hours (8am - 8pm)"          -ForegroundColor White
-    Write-Host "4. Disable Superfetch (SysMain)"          -ForegroundColor White
-    Write-Host "5. Set Windows Search to Manual (WSearch)" -ForegroundColor White
-    Write-Host "6. Disable Xbox Services"                  -ForegroundColor White
-    Write-Host "7. Remove Provisioned Packages (new account bloatware)" -ForegroundColor White
-    Write-Host "8. Apply ALL settings"                     -ForegroundColor White
-    Write-Host "9. Return to Main Menu"                    -ForegroundColor Gray
-    Write-Host "`n========================================" -ForegroundColor Cyan
+    [xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Windows Settings" Height="620" Width="420"
+        Background="#121212" WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
 
-    $choice = Read-Host "`nSelect option [1-9]"
+        <TextBlock Text="Select settings to apply" Foreground="#ff00ff"
+                   FontSize="18" FontWeight="Bold" Margin="0,0,0,16"/>
 
-    switch ($choice) {
-        "1" { Disable-WindowsWidgets }
-        "2" { Enable-MicrosoftUpdateProducts }
-        "3" { Set-ActiveHours }
-        "4" { Disable-Superfetch }
-        "5" { Disable-WindowsSearch }
-        "6" { Disable-XboxServices }
-        "7" { Remove-ProvisionedBloatware }
-        "8" {
-            Disable-WindowsWidgets
-            Enable-MicrosoftUpdateProducts
-            Set-ActiveHours
-            Disable-Superfetch
-            Disable-WindowsSearch
-            Disable-XboxServices
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,0,0,8">
+            <StackPanel>
+
+                <!-- WIDGETS -->
+                <TextBlock Text="Widgets" Foreground="#888888" FontSize="11"
+                           Margin="0,4,0,4" FontStyle="Italic"/>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkWidgetsOff" Content="Disable Windows Widgets" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Disables widgets via group policy."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Re-enables widgets via group policy."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkWidgetsOn" Content="Enable Windows Widgets" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Sets AllowNewsAndInterests = 1 via Group Policy (HKLM). Restarts Explorer to apply."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Sets AllowNewsAndInterests = 1 via Group Policy. Restarts Explorer."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <!-- UPDATES -->
+                <TextBlock Text="Updates" Foreground="#888888" FontSize="11"
+                           Margin="0,12,0,4" FontStyle="Italic"/>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkMUUpdate" Content="Enable Microsoft Product Updates" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Registers the Microsoft Update service so Windows Update also covers Office, Edge, and other Microsoft products."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Registers Microsoft Update service so Windows Update covers Office, Edge, and other Microsoft products."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkHours" Content="Set Active Hours (8am - 8pm)" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Prevents Windows from restarting for updates between 8:00 AM and 8:00 PM. Disables Smart Active Hours."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Prevents restarts for updates between 8am - 8pm. Disables Smart Active Hours."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <!-- SERVICES -->
+                <TextBlock Text="Services" Foreground="#888888" FontSize="11"
+                           Margin="0,12,0,4" FontStyle="Italic"/>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkSuperfetch" Content="Disable Superfetch (SysMain)" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Stops and disables the SysMain service."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Stops and disables SysMain. Reduces background disk activity, recommended for SSDs."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkWSearch" Content="Set Windows Search to Manual (WSearch)" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Sets WSearch startup to Manual and clears auto-recovery actions so it won't restart automatically."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Sets WSearch to Manual startup and clears recovery actions to prevent auto-restart."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+                <StackPanel Margin="0,4">
+                    <CheckBox x:Name="ChkXbox" Content="Disable Xbox Services" Foreground="White">
+                        <CheckBox.ToolTip>
+                            <ToolTip Content="Stops and disables XboxGipSvc, XboxNetApiSvc, XblGameSave, XblAuthManager, and XboxAppServices."/>
+                        </CheckBox.ToolTip>
+                    </CheckBox>
+                    <TextBlock Text="Stops and disables Xbox background services."
+                               Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+
+            </StackPanel>
+        </ScrollViewer>
+
+        <CheckBox x:Name="ChkAll" Grid.Row="2" Content="Select all"
+                  Foreground="#ff00ff" FontWeight="Bold" Margin="0,4,0,16"/>
+
+        <Button x:Name="BtnApply" Grid.Row="3" Content="APPLY SELECTED"
+                Height="35" Background="#ff3333" Foreground="White" FontWeight="Bold"/>
+    </Grid>
+</Window>
+"@
+
+    # --- Everything below this line is unchanged ---
+    $reader = New-Object System.Xml.XmlNodeReader $xaml
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+
+    $chkWidgetsOff = $window.FindName("ChkWidgetsOff")
+    $chkWidgetsOn  = $window.FindName("ChkWidgetsOn")
+    $chkAll        = $window.FindName("ChkAll")
+    $btnApply      = $window.FindName("BtnApply")
+
+    $checkboxes = @(
+        $chkWidgetsOff,
+        $chkWidgetsOn,
+        $window.FindName("ChkMUUpdate"),
+        $window.FindName("ChkHours"),
+        $window.FindName("ChkSuperfetch"),
+        $window.FindName("ChkWSearch"),
+        $window.FindName("ChkXbox")
+    )
+
+    $chkWidgetsOff.Add_Click({
+        if ($chkWidgetsOff.IsChecked) { $chkWidgetsOn.IsChecked = $false }
+        if ($checkboxes | Where-Object { -not $_.IsChecked }) {
+            $chkAll.IsChecked = $false
+        } else {
+            $chkAll.IsChecked = $true
         }
-        "9" { return }
-        default {
-            Write-Host "[ERROR] Invalid selection." -ForegroundColor Red
-            Start-Sleep -Seconds 2
-            Show-WindowsSettingsMenu
+    })
+
+    $chkWidgetsOn.Add_Click({
+        if ($chkWidgetsOn.IsChecked) { $chkWidgetsOff.IsChecked = $false }
+        if ($checkboxes | Where-Object { -not $_.IsChecked }) {
+            $chkAll.IsChecked = $false
+        } else {
+            $chkAll.IsChecked = $true
         }
+    })
+
+    $chkAll.Add_Click({
+        $state = $chkAll.IsChecked
+        foreach ($cb in $checkboxes) { $cb.IsChecked = $state }
+        if ($state) { $chkWidgetsOn.IsChecked = $false }
+    })
+
+    $otherBoxes = $checkboxes | Where-Object { $_ -ne $chkWidgetsOff -and $_ -ne $chkWidgetsOn }
+    foreach ($cb in $otherBoxes) {
+        $cb.Add_Click({
+            if ($checkboxes | Where-Object { -not $_.IsChecked }) {
+                $chkAll.IsChecked = $false
+            } else {
+                $chkAll.IsChecked = $true
+            }
+        })
     }
 
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "Press any key to return to main menu..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    $btnApply.Add_Click({
+        $anySelected = $checkboxes | Where-Object { $_.IsChecked }
+        if (-not $anySelected) {
+            [System.Windows.MessageBox]::Show(
+                "No settings selected.",
+                "Nothing to do",
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Information
+            )
+            return
+        }
+        $window.DialogResult = $true
+        $window.Close()
+    })
+
+    if ($window.ShowDialog()) {
+        if ($window.FindName("ChkWidgetsOff").IsChecked) { Disable-WindowsWidgets }
+        if ($window.FindName("ChkWidgetsOn").IsChecked)  { Enable-WindowsWidgets  }
+        if ($window.FindName("ChkMUUpdate").IsChecked)   { Enable-MicrosoftUpdateProducts }
+        if ($window.FindName("ChkHours").IsChecked)      { Set-ActiveHours }
+        if ($window.FindName("ChkSuperfetch").IsChecked) { Disable-Superfetch }
+        if ($window.FindName("ChkWSearch").IsChecked)    { Disable-WindowsSearch }
+        if ($window.FindName("ChkXbox").IsChecked)       { Disable-XboxServices }
+
+        Write-Host "`n========================================" -ForegroundColor Cyan
+        Write-Host "Selected settings applied." -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "`nPress any key to return to main menu..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
 }
 
 # ============================================================================
@@ -1057,3 +1120,9 @@ if ($workflowState -and $workflowState.Stage -eq "POST_UNINSTALL") {
 }
 
 Show-MainMenu
+
+# $HKCU_Advanced = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+# $HKCU_Search   = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"
+
+# Set-ItemProperty -Path $HKCU_Advanced -Name "ShowTaskViewButton" -Value 0 -Erion SilentlyContinue
+# Set-ItemProperty -Path $HKCU_Search   -Name "SearchboxTaskbarMode" -Value 0 -ErrorAction SilentlyContinuerorAct

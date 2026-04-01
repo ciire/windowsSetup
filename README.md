@@ -25,7 +25,7 @@ A unified PowerShell utility designed to streamline Windows deployment by removi
 
 ## 📂 Project Structure
 
-* `SoftwareManager.ps1`: The main script containing all logic and GUI.
+* `autoSetup.ps1`: The main script containing all logic and GUI.
 * `installers.csv`: Your custom list of software to install (template below).
 * `apps_to_remove.txt`: (Auto-generated) Stores your preferred bloatware removal list for future runs.
 

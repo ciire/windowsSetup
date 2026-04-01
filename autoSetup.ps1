@@ -30,13 +30,13 @@ function Get-WorkflowState {
 function Set-WorkflowState {
     param(
         [string]$Stage,
-        [string]$InstallChoice
+        [string]$CsvPath
     )
     $statePath = Join-Path $env:TEMP "software_manager_workflow.json"
     $state = @{
-        Stage         = $Stage
-        InstallChoice = $InstallChoice
-        Timestamp     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Stage     = $Stage
+        CsvPath   = $CsvPath
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     }
     $state | ConvertTo-Json | Out-File $statePath -Force
     Write-Host "[WORKFLOW] State saved: $Stage" -ForegroundColor Gray
@@ -78,7 +78,7 @@ function Test-Admin {
 }
 
 # ============================================================================
-# ALL-USER HIVE HELPERS
+# ALL-USER HELPERS
 # ============================================================================
 
 function Get-AllUserProfilePaths {
@@ -224,7 +224,7 @@ function Show-UninstallGUI {
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Text="Select Applications to Remove" Foreground="#ff00ff" FontSize="18" Margin="0,0,0,10" FontWeight="Bold"/>
+        <TextBlock Text="Windows System Settings" Foreground="#ff00ff" FontSize="18" Margin="0,0,0,10" FontWeight="Bold"/>
         <CheckBox x:Name="UseTemplate" Grid.Row="1" Content="Select apps from apps_to_remove text file"
                   Foreground="#ff00ff" Margin="0,0,0,10" IsChecked="False" VerticalAlignment="Center"/>
         <ListBox x:Name="AppListBox" Grid.Row="2" Background="#1e1e1e" Foreground="White" BorderThickness="0">
@@ -282,7 +282,7 @@ function Show-UninstallGUI {
     if ($uwpSelected) {
         $uwpNames = ($uwpSelected | ForEach-Object { "  - $($_.DisplayName)" }) -join "`n"
         $uwpWarning = [System.Windows.MessageBox]::Show(
-            "The following UWP apps you selected may not be restored after a PC reset:`n`n$uwpNames`n`nAre you sure you want to uninstall them?",
+            "The following UWP apps you selected may not be restored after a local PC reset:`n`n$uwpNames`n`nAre you sure you want to uninstall them?",
             "UWP App Warning",
             [System.Windows.MessageBoxButton]::YesNo,
             [System.Windows.MessageBoxImage]::Warning
@@ -340,19 +340,11 @@ function Disable-WindowsWidgets {
     $name = "AllowNewsAndInterests"
 
     try {
-        # 1. Ensure the "Dsh" (Dashboard) key exists in Policies
-        if (-not (Test-Path $registryPath)) { 
-            New-Item -Path $registryPath -Force | Out-Null 
+        if (-not (Test-Path $registryPath)) {
+            New-Item -Path $registryPath -Force | Out-Null
         }
-
-        # 2. Set the value to 0 (Disabled)
-        # This is the "hard" disable that mimics the Group Policy Editor
         Set-ItemProperty -Path $registryPath -Name $name -Value 0 -Type DWord
         Write-Host "[+] Policy updated: Windows Widgets (News and Interests) disabled." -ForegroundColor Green
-
-        # 3. Force the shell to recognize the policy change
-        # Since HKLM policies usually require a restart or explorer kill, 
-        # we can try to nudge it, but killing Explorer is the most reliable here.
         Stop-Process -Name Explorer -Force
         Write-Host "[+] Explorer restarted to apply system policy." -ForegroundColor Cyan
     }
@@ -360,6 +352,7 @@ function Disable-WindowsWidgets {
         Write-Host "[!] Error: $($_.Exception.Message). Did you run as Administrator?" -ForegroundColor Red
     }
 }
+
 # ============================================================================
 # SUPERFETCH (SYSMAIN) MANAGEMENT
 # ============================================================================
@@ -427,7 +420,6 @@ function Disable-WindowsSearch {
         Write-Host " [i] Service already stopped." -ForegroundColor Gray
     }
 
-    # Wait up to 15 seconds for service to fully stop
     $waited = 0
     while ($waited -lt 15) {
         $checkSvc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
@@ -436,7 +428,6 @@ function Disable-WindowsSearch {
         $waited++
     }
 
-    # Clear recovery actions so Windows cannot auto-restart it
     Write-Host " [>] Clearing auto-recovery actions..." -ForegroundColor Gray
     $null = sc.exe failure $serviceName reset= 0 actions= "" 2>&1
     $null = sc.exe failureflag $serviceName 0 2>&1
@@ -527,108 +518,283 @@ function Invoke-AppRemoval {
     Write-Host "`n[REMOVING] $name" -ForegroundColor Cyan
 
     try {
-        # --- UWP (Appx) removal ---
+        # --- Handle UWP (Windows Store) Apps ---
         if ($App.Type -eq "UWP") {
-            # Extract the PackageName carefully
             $pName = ($App.Id -split "_")[0]
-            
-            # THE FIX: Use -AllUsers to hit current + future profiles 
-            # without touching the 'Provisioned' master list.
             Get-AppxPackage -AllUsers -Name "*$pName*" | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-            
-            Write-Host " [SUCCESS] $name removed for all users (Provisioned list preserved)." -ForegroundColor Green
+            Write-Host " [SUCCESS] $name removed for all users." -ForegroundColor Green
             return
         }
 
-        # --- Win32 removal ---
-        # (Your existing Win32 logic is solid, but let's ensure it handles quotes)
+        # --- Handle Win32 (Desktop) Apps ---
         $uninstStr = $App.UninstallString.Trim()
-        
-        # ... [Your existing logic for msiexec and regex matching] ...
-        
-        # Note: Win32 apps are usually "Machine-wide" or "Per-User". 
-        # If it's in HKLM, removing it once removes it for all.
-        # If it's in HKCU, your 'Remove-PerUserRegistryKeys' handles the cleanup.
+        $exePath = ""
+        $arguments = ""
 
-        # [Rest of your Start-Process and Registry cleanup logic]
+        if ($uninstStr -match "msiexec") {
+            # MSI Logic: Extract the GUID
+            if ($uninstStr -match '(?<guid>{[A-F0-9-]+})') {
+                $guid = $Matches['guid']
+                $exePath = "msiexec.exe"
+                $arguments = "/x $guid /qn /norestart"
+            }
+        } 
+        else {
+            # EXE Logic: Properly split Path from existing Arguments
+            # This Regex looks for a quoted string at the start OR the first space
+            if ($uninstStr -match '^"(?<path>[^"]+)"\s*(?<args>.*)$') {
+                $exePath = $Matches['path']
+                $arguments = $Matches['args']
+            } else {
+                # Fallback for unquoted strings (less common but happens)
+                $split = $uninstStr -split " ", 2
+                $exePath = $split[0].Replace('"', '')
+                $arguments = if ($split.Count -gt 1) { $split[1] } else { "" }
+            }
+
+            # Append the universal silent flag if not already there
+            if ($arguments -notmatch "/S") { $arguments = "$arguments /S".Trim() }
+        }
+
+        # --- THE FIX: Direct Execution ---
+        if ($exePath) {
+            # Using -NoNewWindow and -Wait ensures PowerShell stays in control
+            # without spawning a CMD window that requires manual closing.
+            Start-Process -FilePath $exePath -ArgumentList $arguments -Wait -NoNewWindow -ErrorAction Stop
+            Write-Host " [SUCCESS] $name uninstalled." -ForegroundColor Green
+        }
+
     } catch {
-        Write-Host " [!] Critical Error: Could not launch $name uninstaller." -ForegroundColor Red
+        Write-Host " [!] Critical Error: Could not launch $name uninstaller. $($_.Exception.Message)" -ForegroundColor Red
     }
 }
-
 # ============================================================================
-# SOFTWARE DETECTION
+# CSV-BASED INSTALLATION (from autoInstaller.ps1)
 # ============================================================================
 
-function Test-AdobeInstalled {
-    $paths = @(
-        "C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRdr.exe",
-        "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRdr.exe",
-        "C:\Program Files\Adobe\Acrobat Reader DC\Reader\Acrobat.exe"
+function Write-InstallLog {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR")]
+        [string]$Level = "INFO"
     )
-    foreach ($path in $paths) { if (Test-Path $path) { return $true } }
-    return $false
-}
-
-function Test-LibreOfficeInstalled {
-    return (Test-Path "C:\Program Files\LibreOffice\program\soffice.exe")
-}
-
-# ============================================================================
-# SOFTWARE INSTALLATION
-# ============================================================================
-
-function Install-Adobe {
-    param([string]$InstallerPath)
-    if (-not (Test-Path $InstallerPath)) { Write-Host "[ERROR] Adobe installer not found at: $InstallerPath" -ForegroundColor Red; return }
-
-    Write-Host "`n[INSTALLING] Adobe Acrobat Reader..." -ForegroundColor Cyan
-    $proc = Start-Process -FilePath $InstallerPath -ArgumentList "/sAll /rs /msi /qn" -PassThru
-    Write-Host " [>] Installer launched (PID: $($proc.Id))" -ForegroundColor Gray
-    $proc | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
-    Write-Host " [>] Monitoring installation progress..." -ForegroundColor Gray
-
-    $maxWait = 300; $elapsed = 0; $checkInterval = 5
-    while ($elapsed -lt $maxWait) {
-        $adobeMsi = Get-Process -Name msiexec -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowTitle -like "*Adobe*" -or $_.CommandLine -like "*Acro*" }
-        if (-not $adobeMsi) { Write-Host "`n [SUCCESS] Adobe installation complete." -ForegroundColor Green; return }
-        Write-Host "." -NoNewline -ForegroundColor Gray
-        Start-Sleep -Seconds $checkInterval
-        $elapsed += $checkInterval
+    switch ($Level) {
+        "INFO"  { Write-Host $Message -ForegroundColor Cyan }
+        "WARN"  { Write-Host $Message -ForegroundColor Yellow }
+        "ERROR" { Write-Host $Message -ForegroundColor Red }
     }
-    Write-Host "`n [TIMEOUT] Installation may still be running in background." -ForegroundColor Yellow
 }
 
-function Install-LibreOffice {
-    param([string]$InstallerPath)
-    if (-not (Test-Path $InstallerPath)) { Write-Host "[ERROR] LibreOffice installer not found at: $InstallerPath" -ForegroundColor Red; return }
-
-    Write-Host "`n[INSTALLING] LibreOffice..." -ForegroundColor Cyan
-    $proc = Start-Process "msiexec.exe" -ArgumentList "/i `"$InstallerPath`" /qn /norestart" -PassThru -Wait
-
-    if      ($proc.ExitCode -eq 0)    { Write-Host " [SUCCESS] LibreOffice installed successfully."        -ForegroundColor Green  }
-    elseif  ($proc.ExitCode -eq 3010) { Write-Host " [SUCCESS] LibreOffice installed (restart required)." -ForegroundColor Yellow }
-    else                              { Write-Host " [ERROR] Installation failed (Exit Code: $($proc.ExitCode))." -ForegroundColor Red }
+function Test-CsvStructure {
+    param([object[]]$Rows)
+    $requiredColumns = @("Name", "InstallerPath", "InstallerType", "SilentArgs")
+    $actualColumns   = $Rows[0].PSObject.Properties.Name
+    $missingColumns  = $requiredColumns | Where-Object { $_ -notin $actualColumns }
+    if ($missingColumns.Count -gt 0) {
+        Write-Host "[ERROR] CSV is missing required columns: $($missingColumns -join ', ')" -ForegroundColor Red
+        return $false
+    }
+    return $true
 }
 
-function Install-BothApps {
-    param([string]$AdobePath, [string]$LibrePath)
+function Test-CsvRows {
+    param([object[]]$Rows)
+    $validationErrors = @()
+    $validTypes = @("exe", "msi")
+    foreach ($row in $Rows) {
+        $name = $row.Name
+        if ([string]::IsNullOrWhiteSpace($row.InstallerPath)) {
+            $validationErrors += "[$name] InstallerPath is empty."
+        } elseif (-not (Test-Path $row.InstallerPath -PathType Leaf)) {
+            $validationErrors += "[$name] File not found: $($row.InstallerPath)"
+        }
+        if ([string]::IsNullOrWhiteSpace($row.InstallerType)) {
+            $validationErrors += "[$name] InstallerType is empty."
+        } elseif ($row.InstallerType.ToLower() -notin $validTypes) {
+            $validationErrors += "[$name] Unknown InstallerType '$($row.InstallerType)'. Must be: $($validTypes -join ', ')"
+        }
+    }
+    return $validationErrors
+}
 
-    Write-Host "`n[STEP 1] Installing Adobe Acrobat..." -ForegroundColor Cyan
-    $null = Start-Process -FilePath $AdobePath -ArgumentList "/sAll /rs /msi /qn /norestart" -PassThru -Wait
-    Write-Host " [>] Adobe wrapper finished. Waiting for background MSI..." -ForegroundColor Gray
-    Start-Sleep -Seconds 15
+function Invoke-ExeInstall {
+    param([string]$Path, [string]$SilentArgs, [int]$TimeoutSeconds = 300)
+    if ([string]::IsNullOrWhiteSpace($SilentArgs)) {
+        $process = Start-Process -FilePath $Path -PassThru
+    } else {
+        $process = Start-Process -FilePath $Path -ArgumentList $SilentArgs -PassThru
+    }
+    $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $finished) {
+        Write-Host "  [WARN] Installer timed out after $TimeoutSeconds seconds. Killing process." -ForegroundColor Yellow
+        $process.Kill()
+        return [int]1602
+    }
+    $code = $process.ExitCode
+    if ($null -eq $code) { return [int]1602 }
+    return [int]$code
+}
 
-    while (Get-Process msiexec -ErrorAction SilentlyContinue) {
-        Write-Host "." -NoNewline -ForegroundColor Gray
-        Start-Sleep -Seconds 5
+function Invoke-MsiInstall {
+    param([string]$Path, [string]$SilentArgs, [int]$TimeoutSeconds = 300)
+    if ([string]::IsNullOrWhiteSpace($SilentArgs)) {
+        $msiArgs = "/i `"$Path`""
+    } else {
+        $msiArgs = "/i `"$Path`" $SilentArgs"
+    }
+    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -PassThru
+    $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $finished) {
+        Write-Host "  [WARN] Installer timed out after $TimeoutSeconds seconds. Killing process." -ForegroundColor Yellow
+        $process.Kill()
+        return [int]1602
+    }
+    $code = $process.ExitCode
+    if ($null -eq $code) { return [int]1602 }
+    return [int]$code
+}
+
+function Resolve-InstallExitCode {
+    param([int]$Code)
+    switch ($Code) {
+        0    { return "Success" }
+        3010 { return "RebootRequired" }
+        1602 { return "Cancelled" }
+        1618 { return "AnotherInstallRunning" }
+        1    { return "Cancelled" }
+        62   { return "Cancelled" }
+        default { return "Failed" }
+    }
+}
+
+function Get-SummaryContext {
+    param(
+        [string]$Result,
+        [object]$ExitCode
+    )
+    if ($ExitCode -is [int]) {
+        switch ($Result) {
+            "Success"               { return "exit code $ExitCode - most likely a success" }
+            "RebootRequired"        { return "exit code $ExitCode - most likely a success, but a reboot is required" }
+            "Cancelled"             { return "exit code $ExitCode - most likely cancelled by the user" }
+            "AnotherInstallRunning" { return "exit code $ExitCode - another install was already running" }
+            default                 { return "exit code $ExitCode - most likely a failure" }
+        }
+    } else {
+        return $Result
+    }
+}
+
+function Install-FromCsv {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CsvPath,
+        [switch]$DryRun
+    )
+
+    Write-InstallLog "Starting CSV-based installation. CSV: $CsvPath"
+    if ($DryRun) { Write-InstallLog "DRY RUN mode enabled. No installers will be executed." -Level WARN }
+
+    # Import and validate CSV
+    try {
+        $rows = Import-Csv -Path $CsvPath
+    } catch {
+        Write-InstallLog "Failed to read CSV: $_" -Level ERROR
+        return
     }
 
-    Write-Host "`n[STEP 2] Installing LibreOffice..." -ForegroundColor Cyan
-    if (Test-Path $LibrePath) {
-        $null = Start-Process "msiexec.exe" -ArgumentList "/i `"$LibrePath`" /qn /norestart" -PassThru -Wait
-        Write-Host " [SUCCESS] All installations finished." -ForegroundColor Green
+    if ($rows.Count -eq 0) {
+        Write-InstallLog "CSV is empty. Nothing to install." -Level WARN
+        return
+    }
+
+    if (-not (Test-CsvStructure -Rows $rows)) { return }
+
+    $rowErrors = Test-CsvRows -Rows $rows
+    if ($rowErrors.Count -gt 0) {
+        Write-InstallLog "Validation failed. Fix the following errors before running:" -Level ERROR
+        $rowErrors | ForEach-Object { Write-InstallLog $_ -Level ERROR }
+        return
+    }
+
+    Write-InstallLog "Validation passed. $($rows.Count) installer(s) queued."
+
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($row in $rows) {
+        $name       = $row.Name
+        $path       = $row.InstallerPath
+        $type       = $row.InstallerType.ToLower()
+        $silentArgs = $row.SilentArgs
+
+        Write-InstallLog "Processing: $name"
+
+        $alreadyInstalled = Get-ItemProperty `
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like "*$name*" }
+
+        if ($alreadyInstalled) {
+            Write-InstallLog "  $name is already installed. Skipping." -Level WARN
+            $results.Add([PSCustomObject]@{ Name = $name; Result = "Skipped"; ExitCode = $null })
+            continue
+        }
+
+        if ($DryRun) {
+            Write-InstallLog "  [DRY RUN] Would run: $path $silentArgs"
+            $results.Add([PSCustomObject]@{ Name = $name; Result = "DryRun"; ExitCode = $null })
+            continue
+        }
+
+        try {
+            $rawExitCode = switch ($type) {
+                "exe" { Invoke-ExeInstall -Path $path -SilentArgs $silentArgs }
+                "msi" { Invoke-MsiInstall -Path $path -SilentArgs $silentArgs }
+            }
+            $exitCode = [int]$rawExitCode
+
+            $result        = Resolve-InstallExitCode -Code $exitCode
+            $resultContext = Get-SummaryContext -Result $result -ExitCode $exitCode
+
+            Write-InstallLog "  $name -> $result ($resultContext)"
+            $results.Add([PSCustomObject]@{ Name = $name; Result = $result; ExitCode = $exitCode })
+
+            if ($result -eq "Cancelled") {
+                Write-InstallLog "  $name was cancelled by user. Moving to next installer." -Level WARN
+                continue
+            }
+
+        } catch {
+            Write-InstallLog "  $name -> Exception during install: $_" -Level ERROR
+            $results.Add([PSCustomObject]@{ Name = $name; Result = "Failed"; ExitCode = $null })
+        }
+    }
+
+    # Summary
+    Write-InstallLog "------- Installation Summary -------"
+    foreach ($entry in $results) {
+        $summaryContext = Get-SummaryContext -Result $entry.Result -ExitCode $entry.ExitCode
+        Write-InstallLog "  $($entry.Name): $summaryContext"
+    }
+
+    # FIX: Use explicit scriptblock syntax for Where-Object to ensure correct filtering
+    # and cast .Count explicitly to [int] so interpolation always renders the number
+    [int]$succeeded = @($results | Where-Object { $_.Result -eq "Success" }).Count
+    [int]$cancelled = @($results | Where-Object { $_.Result -eq "Cancelled" }).Count
+    [int]$reboot    = @($results | Where-Object { $_.Result -eq "RebootRequired" }).Count
+    [int]$failed    = @($results | Where-Object { $_.Result -notin @("Success","RebootRequired","DryRun","Skipped","Cancelled") }).Count
+
+    Write-InstallLog "Succeeded: $succeeded | Cancelled: $cancelled | Reboot Required: $reboot | Failed: $failed"
+
+    if ($reboot -gt 0) {
+        Write-InstallLog "One or more installs require a system reboot." -Level WARN
+    }
+
+    if ($failed -gt 0) {
+        Write-InstallLog "One or more installs failed. Check the log for details." -Level ERROR
+    } else {
+        Write-InstallLog "All installs completed."
     }
 }
 
@@ -637,36 +803,52 @@ function Install-BothApps {
 # ============================================================================
 
 function Show-InstallMenu {
-    $absolutePath   = "C:\setup\installation"
-    $adobeInstaller = "AcroRdrDCx642500121111_MUI.exe"
-    $libreInstaller = "LibreOffice_25.8.4_Win_x86-64.msi"
-    $adobePath      = Join-Path $absolutePath $adobeInstaller
-    $librePath      = Join-Path $absolutePath $libreInstaller
+    while ($true) {
+        Clear-Host
+        Write-Host "`n========================================" -ForegroundColor Cyan
+        Write-Host "    SOFTWARE INSTALLATION MENU"           -ForegroundColor White
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "`nInstalls software defined in a CSV file."  -ForegroundColor Gray
+        Write-Host "Required columns: Name, InstallerPath, InstallerType (exe/msi), SilentArgs" -ForegroundColor Gray
+        Write-Host "`n1. Run installs from CSV"                -ForegroundColor White
+        Write-Host "2. Dry run (validate CSV, no installs)"   -ForegroundColor White
+        Write-Host "3. Return to Main Menu"                   -ForegroundColor Gray
+        Write-Host "`n========================================" -ForegroundColor Cyan
 
-    if (-not (Test-Path $adobePath)) { Write-Host "[WARNING] Adobe installer not found at $adobePath" -ForegroundColor Yellow }
+        $choice = Read-Host "`nSelect option [1-3]"
 
-    Clear-Host
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "    SOFTWARE INSTALLATION MENU"           -ForegroundColor White
-    Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "`n1. Install Adobe Acrobat Reader"         -ForegroundColor White
-    Write-Host "2. Install LibreOffice"                   -ForegroundColor White
-    Write-Host "3. Install BOTH"                          -ForegroundColor White
-    Write-Host "4. Return to Main Menu"                   -ForegroundColor Gray
-    Write-Host "`n========================================" -ForegroundColor Cyan
-
-    $choice = Read-Host "`nSelect option [1-4]"
-    switch ($choice) {
-        "1" { Install-Adobe       -InstallerPath $adobePath }
-        "2" { Install-LibreOffice -InstallerPath $librePath }
-        "3" { Install-BothApps    -AdobePath $adobePath -LibrePath $librePath }
-        "4" { return }
-        default { Write-Host "[ERROR] Invalid selection." -ForegroundColor Red; Start-Sleep -Seconds 2; Show-InstallMenu }
+        switch ($choice) {
+            "1" {
+                $csvInput = Read-Host "`nEnter path to install CSV"
+                $csvInput = $csvInput.Trim('"')
+                if (-not (Test-Path $csvInput -PathType Leaf)) {
+                    Write-Host "[ERROR] File not found: $csvInput" -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                } else {
+                    Install-FromCsv -CsvPath $csvInput
+                    Write-Host "`nPress any key to return to main menu..." -ForegroundColor Gray
+                    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                }
+            }
+            "2" {
+                $csvInput = Read-Host "`nEnter path to install CSV"
+                $csvInput = $csvInput.Trim('"')
+                if (-not (Test-Path $csvInput -PathType Leaf)) {
+                    Write-Host "[ERROR] File not found: $csvInput" -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                } else {
+                    Install-FromCsv -CsvPath $csvInput -DryRun
+                    Write-Host "`nPress any key to return to main menu..." -ForegroundColor Gray
+                    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                }
+            }
+            "3" { return }
+            default {
+                Write-Host "[ERROR] Invalid selection." -ForegroundColor Red
+                Start-Sleep -Seconds 2
+            }
+        }
     }
-
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "Press any key to return to main menu..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
 # ============================================================================
@@ -707,41 +889,36 @@ function Start-UninstallProcess {
 }
 
 # ============================================================================
-# FULL WORKFLOW (UNINSTALL -> RESTART -> INSTALL)
+# Uninstall + Install (UNINSTALL -> RESTART -> INSTALL)
 # ============================================================================
 
 function Start-FullWorkflow {
     Clear-Host
     Write-Host "`n========================================" -ForegroundColor Magenta
-    Write-Host "    FULL WORKFLOW MODE"                    -ForegroundColor White
+    Write-Host "    Uninstall + Install"                    -ForegroundColor White
     Write-Host "========================================" -ForegroundColor Magenta
     Write-Host "`nThis will:"                              -ForegroundColor Yellow
     Write-Host "Step 1. Uninstall selected bloatware"     -ForegroundColor White
     Write-Host "Step 2. Restart your computer"            -ForegroundColor White
-    Write-Host "Step 3. Automatically install software after restart" -ForegroundColor White
+    Write-Host "Step 3. Automatically run installs from CSV after restart" -ForegroundColor White
     Write-Host "`n========================================" -ForegroundColor Magenta
 
-    Write-Host "`nWhat software should be installed AFTER restart?" -ForegroundColor Cyan
-    Write-Host "1. Adobe Acrobat Reader only" -ForegroundColor White
-    Write-Host "2. LibreOffice only"          -ForegroundColor White
-    Write-Host "3. Both"                      -ForegroundColor White
-    Write-Host "4. Cancel workflow"           -ForegroundColor Gray
+    $csvInput = Read-Host "`nEnter path to install CSV (used after restart)"
+    $csvInput = $csvInput.Trim('"')
 
-    $installChoice = Read-Host "`nSelect option [1-4]"
-
-    if ($installChoice -eq "4") {
-        Write-Host "`nWorkflow cancelled." -ForegroundColor Yellow
+    if ([string]::IsNullOrWhiteSpace($csvInput)) {
+        Write-Host "`n[ERROR] No CSV path provided. Workflow cancelled." -ForegroundColor Red
         Start-Sleep -Seconds 2
         return
     }
 
-    if ($installChoice -ne "1" -and $installChoice -ne "2" -and $installChoice -ne "3") {
-        Write-Host "`n[ERROR] Invalid selection." -ForegroundColor Red
+    if (-not (Test-Path $csvInput -PathType Leaf)) {
+        Write-Host "`n[ERROR] File not found: $csvInput" -ForegroundColor Red
         Start-Sleep -Seconds 2
         return
     }
 
-    Set-WorkflowState -Stage "POST_UNINSTALL" -InstallChoice $installChoice
+    Set-WorkflowState -Stage "POST_UNINSTALL" -CsvPath $csvInput
 
     Write-Host "`n========================================" -ForegroundColor Magenta
     Write-Host "Starting uninstall process..."             -ForegroundColor White
@@ -788,7 +965,7 @@ function Start-FullWorkflow {
     Write-Host "READY TO RESTART"                          -ForegroundColor Yellow
     Write-Host "========================================" -ForegroundColor Magenta
     Write-Host "`nThe computer will restart now."          -ForegroundColor White
-    Write-Host "After restart, the installation will begin automatically." -ForegroundColor Cyan
+    Write-Host "After restart, installs from your CSV will begin automatically." -ForegroundColor Cyan
     Write-Host "`nPress any key to restart now, or close this window to cancel..." -ForegroundColor Yellow
 
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -863,7 +1040,6 @@ function Show-WindowsSettingsMenu {
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,0,0,8">
             <StackPanel>
 
-                <!-- WIDGETS -->
                 <TextBlock Text="Widgets" Foreground="#888888" FontSize="11"
                            Margin="0,4,0,4" FontStyle="Italic"/>
 
@@ -887,12 +1063,11 @@ function Show-WindowsSettingsMenu {
                                Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
                 </StackPanel>
 
-                <!-- UPDATES -->
                 <TextBlock Text="Updates" Foreground="#888888" FontSize="11"
                            Margin="0,12,0,4" FontStyle="Italic"/>
 
                 <StackPanel Margin="0,4">
-                    <CheckBox x:Name="ChkMUUpdate" Content="Enable Microsoft Product Updates" Foreground="White">
+                    <CheckBox x:Name="ChkMUUpdate" Content="Enable Windows updates for other Microsoft products" Foreground="White">
                         <CheckBox.ToolTip>
                             <ToolTip Content="Registers the Microsoft Update service so Windows Update also covers Office, Edge, and other Microsoft products."/>
                         </CheckBox.ToolTip>
@@ -911,7 +1086,6 @@ function Show-WindowsSettingsMenu {
                                Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
                 </StackPanel>
 
-                <!-- SERVICES -->
                 <TextBlock Text="Services" Foreground="#888888" FontSize="11"
                            Margin="0,12,0,4" FontStyle="Italic"/>
 
@@ -921,7 +1095,7 @@ function Show-WindowsSettingsMenu {
                             <ToolTip Content="Stops and disables the SysMain service."/>
                         </CheckBox.ToolTip>
                     </CheckBox>
-                    <TextBlock Text="Stops and disables SysMain. Reduces background disk activity, recommended for SSDs."
+                    <TextBlock Text="Stops and disables SysMain. Reduces background disk activity. Recommend for systems with 4GB memory or less."
                                Foreground="#666666" FontSize="11" Margin="20,2,0,0" TextWrapping="Wrap"/>
                 </StackPanel>
 
@@ -957,7 +1131,6 @@ function Show-WindowsSettingsMenu {
 </Window>
 "@
 
-    # --- Everything below this line is unchanged ---
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
 
@@ -1054,8 +1227,8 @@ function Show-MainMenu {
         Write-Host "    SOFTWARE MANAGEMENT TOOL"             -ForegroundColor White
         Write-Host "========================================" -ForegroundColor Cyan
         Write-Host "`n1. UNINSTALL Bloatware/Applications"    -ForegroundColor Gray
-        Write-Host "2. INSTALL Software (Adobe, LibreOffice)" -ForegroundColor Gray
-        Write-Host "3. FULL WORKFLOW (Uninstall -> Restart -> Install)" -ForegroundColor Gray
+        Write-Host "2. INSTALL Software (from CSV)"           -ForegroundColor Gray
+        Write-Host "3. FULL WORKFLOW (Uninstall -> Restart -> Install from CSV)" -ForegroundColor Gray
         Write-Host "4. WINDOWS SETTINGS (Widgets / Updates / Active Hours / Superfetch)" -ForegroundColor Gray
         Write-Host "5. Exit"                                  -ForegroundColor Gray
         Write-Host "`n========================================" -ForegroundColor Cyan
@@ -1085,28 +1258,20 @@ Test-Admin
 $workflowState = Get-WorkflowState
 
 if ($workflowState -and $workflowState.Stage -eq "POST_UNINSTALL") {
-    $absolutePath = "C:\setup\installation"
-
-    if (Test-Path $absolutePath) {
-        Set-Location -Path $absolutePath
-        Write-Host "[WORKFLOW] Working directory set to: $absolutePath" -ForegroundColor Gray
-    }
-
     Write-Host "`n========================================" -ForegroundColor Magenta
     Write-Host "    WORKFLOW CONTINUATION DETECTED"        -ForegroundColor White
     Write-Host "========================================" -ForegroundColor Magenta
     Write-Host "`nResuming installation phase..."           -ForegroundColor Cyan
     Start-Sleep -Seconds 3
 
-    $adobeInstaller = "AcroRdrDCx642500121111_MUI.exe"
-    $libreInstaller = "LibreOffice_25.8.4_Win_x86-64.msi"
-    $adobePath      = Join-Path $absolutePath $adobeInstaller
-    $librePath      = Join-Path $absolutePath $libreInstaller
+    $csvPath = $workflowState.CsvPath
 
-    switch ($workflowState.InstallChoice) {
-        "1" { Write-Host "`n[WORKFLOW] Installing Adobe Acrobat Reader..." -ForegroundColor Cyan; Install-Adobe       -InstallerPath $adobePath }
-        "2" { Write-Host "`n[WORKFLOW] Installing LibreOffice..."          -ForegroundColor Cyan; Install-LibreOffice -InstallerPath $librePath }
-        "3" { Write-Host "`n[WORKFLOW] Installing both applications..."    -ForegroundColor Cyan; Install-BothApps    -AdobePath $adobePath -LibrePath $librePath }
+    if (-not (Test-Path $csvPath -PathType Leaf)) {
+        Write-Host "[ERROR] CSV not found at saved path: $csvPath" -ForegroundColor Red
+        Write-Host "Please run the install menu manually." -ForegroundColor Yellow
+    } else {
+        Write-Host "`n[WORKFLOW] Installing from CSV: $csvPath" -ForegroundColor Cyan
+        Install-FromCsv -CsvPath $csvPath
     }
 
     Clear-WorkflowState
@@ -1120,9 +1285,3 @@ if ($workflowState -and $workflowState.Stage -eq "POST_UNINSTALL") {
 }
 
 Show-MainMenu
-
-# $HKCU_Advanced = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-# $HKCU_Search   = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search"
-
-# Set-ItemProperty -Path $HKCU_Advanced -Name "ShowTaskViewButton" -Value 0 -Erion SilentlyContinue
-# Set-ItemProperty -Path $HKCU_Search   -Name "SearchboxTaskbarMode" -Value 0 -ErrorAction SilentlyContinuerorAct
